@@ -1,0 +1,9 @@
+redis==5.2.0
+redisvl==0.3.6
+sentence-transformers==3.2.1
+fastapi
+uvicorn
+httpx
+python-dotenv
+langchain-openai
+redis-iris

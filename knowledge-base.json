@@ -1,0 +1,50 @@
+[
+    {
+        "prompt": "How do I setup Autopay",
+        "response": "You can setup Autopay under, Settings > Accounts > Payments.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    },
+    {
+        "prompt": "I lost my policy number",
+        "response": "No worries, I can help you find your Policy Number. Can you confirm you date of birth and 5 digit zip code.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    },
+    {
+        "prompt": "Do you offer a discount for veterans?",
+        "response": "We offer a 10% discount only to veterans and active-duty military members.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    },
+    {
+        "prompt": "Do you offer insurance in South America?",
+        "response": "Yes, we offer insurance in Brazil, Columbia, Chile and Argentina.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    },
+    {
+        "prompt": "Do you offer food delivery?",
+        "response": "Yes, we offer delivery through our website as well as major third-party delivery apps.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    },
+    {
+        "prompt": "What are your hours of operation?",
+        "response": "We are open Monday through Saturday from 11am to 10pm, and Sunday from 11am to 9pm.",
+        "attributes": {
+            "application_id": "APP-2012",
+            "uid": "R-0927"
+        }
+    }
+]

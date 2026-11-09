@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+FastAPI web server wrapping the MemoryPromptAgent for a chat UI.
+Run with: uvicorn web_app:app --reload
+"""
+
+import os
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+import utils
+from personal_assistant import MemoryPromptAgent
+from utils import SemanticWrapper
+
+load_dotenv()
+
+app = FastAPI(title="Memory Agent Chat")
+
+# Single shared agent instance (lazy init)
+_agent: MemoryPromptAgent | None = None
+_semantic_wrapper: SemanticWrapper | None = None
+
+
+def get_agent() -> MemoryPromptAgent:
+    global _agent
+    if _agent is None:
+        _agent = MemoryPromptAgent()
+    return _agent
+
+
+def get_semantic_wrapper() -> SemanticWrapper:
+    global _semantic_wrapper
+    if _semantic_wrapper is None:
+        _semantic_wrapper = SemanticWrapper(redis_connection=None)
+    return _semantic_wrapper
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "web_session"
+    user_id: str = "web_user"
+
+
+class ChatResponse(BaseModel):
+    response: str
+    source: Literal["llm", "cache", "faq", "rejected"]
+
+
+@app.on_event("startup")
+async def startup():
+    # Eagerly set up the semantic router, semantic cache, and Agent Playbooks
+    # client at process start, instead of paying that cost on the first
+    # /chat request.
+    get_semantic_wrapper()
+
+
+@app.get("/")
+async def root():
+    html_path = Path(__file__).parent / "index.html"
+    return FileResponse(html_path)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    if not utils.resolve_env("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+
+    sw = get_semantic_wrapper()
+
+    # Semantic router guardrail
+    route = sw.get_route(req.message)
+    if route == "reject":
+        return ChatResponse(
+            response="This question violates the terms of our user agreement.",
+            source="rejected",
+        )
+
+    # Route FAQ questions to the Agent Playbooks knowledge base
+    if route == "FAQ":
+        faq_answer = sw.get_faq_answer(req.message)
+        if faq_answer != "NONE":
+            return ChatResponse(response=faq_answer, source="faq")
+
+    # Semantic cache check
+    cached = sw.get_similar(req.message, user_id=req.user_id, session_id=req.session_id)
+    if cached != "NONE":
+        return ChatResponse(response=cached, source="cache")
+
+    # Full LLM call
+    agent = get_agent()
+    response = await agent.process_user_input(req.message, req.session_id, req.user_id)
+
+    # Store in semantic cache on success
+    if "error processing your request" not in response:
+        sw.set_cache(
+            query=req.message,
+            response=response,
+            user_id=req.user_id,
+            session_id=req.session_id,
+        )
+
+    return ChatResponse(response=response, source="llm")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _agent
+    if _agent:
+        await _agent.cleanup()
