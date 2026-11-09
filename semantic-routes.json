@@ -1,0 +1,14 @@
+[
+    {
+        "name": "FAQ", 
+        "references": ["countries of operation","account recovery","veterans discount","hours of operation"]
+    },
+    {
+        "name": "reject", 
+        "references": ["love","romance","sexual content","race", "violence", "crime","stereotype","serve alcohol", "food delivery" ]
+    },
+    {
+        "name": "accept", 
+        "references": ["insurance","jewellery","health","policy","yes","no","hello","bye","thanks","proceed","KYC","personal details","preferences"]
+    }
+]

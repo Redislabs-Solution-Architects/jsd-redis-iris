@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import utils
-from personal_assistant import MemoryPromptAgent
+from personal_assistant import REJECT_MESSAGE, MemoryPromptAgent
 from utils import SemanticWrapper
 
 load_dotenv()
@@ -66,6 +66,12 @@ async def root():
     return FileResponse(html_path)
 
 
+async def reply(req: ChatRequest, response: str, source: str) -> ChatResponse:
+    """Answer from the FAQ or the cache, recording the exchange in Agent Memory."""
+    await get_agent().record_exchange(req.session_id, req.user_id, req.message, response, source)
+    return ChatResponse(response=response, source=source)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     if not req.message.strip():
@@ -79,21 +85,19 @@ async def chat(req: ChatRequest):
     # Semantic router guardrail
     route = sw.get_route(req.message)
     if route == "reject":
-        return ChatResponse(
-            response="This question violates the terms of our user agreement.",
-            source="rejected",
-        )
+        # Blocked messages are deliberately not recorded in Agent Memory.
+        return ChatResponse(response=REJECT_MESSAGE, source="rejected")
 
     # Route FAQ questions to the Agent Playbooks knowledge base
     if route == "FAQ":
         faq_answer = sw.get_faq_answer(req.message)
         if faq_answer != "NONE":
-            return ChatResponse(response=faq_answer, source="faq")
+            return await reply(req, faq_answer, "faq")
 
     # Semantic cache check
     cached = sw.get_similar(req.message, user_id=req.user_id, session_id=req.session_id)
     if cached != "NONE":
-        return ChatResponse(response=cached, source="cache")
+        return await reply(req, cached, "cache")
 
     # Full LLM call
     agent = get_agent()
