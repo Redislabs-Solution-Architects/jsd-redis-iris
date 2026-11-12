@@ -24,14 +24,17 @@ flowchart TD
     D -- yes --> H[Cached answer]
     D -- no --> E[Agent Memory: recall user memories and read the session transcript]
     E --> G[LLM answers with that context]
-    G --> I[Agent Memory: record both turns]
-    I --> J[Store the answer in the semantic cache]
+    G --> J[Store the answer in the semantic cache]
+    F --> M[(Agent Memory: record the question and the reply)]
+    H --> M
+    G --> M
 ```
 
 1. **Semantic router** classifies the message. `reject` is answered with a fixed refusal. `FAQ` goes to the knowledge base. Everything else continues.
 2. **FAQ knowledge base**: Agent Playbooks scores the question against the published FAQs. A match at or above `FAQ_SEMANTIC_THRESHOLD` is returned as is. Otherwise the question falls through.
 3. **Semantic cache** returns a previous answer to a similar question, scoped to the same user and session (10-minute TTL).
 4. **LLM with memory**: the user's message is recorded, relevant long-term memories are recalled, and the session transcript (summary first, then recent turns) is added to the system prompt. The answer is recorded back to the session and cached.
+5. **What is recorded.** Answers from the FAQ, the cache and the LLM are recorded in Agent Memory as session events: the question and the reply. This keeps the transcript complete and lets the service extract memories from it. Each event carries the route that produced it (`faq`, `cache` or `llm`) as metadata, which the model never sees. **Blocked messages are never recorded**, neither the message nor the refusal. Recording an FAQ or cached reply is best effort: if Agent Memory is unavailable the error is logged and the reply is still returned.
 
 The UI shows where each answer came from: `LLM`, `Cached`, `FAQ` or `Blocked`.
 
@@ -126,7 +129,7 @@ Edit the `references` lists to change what is blocked or sent to the FAQ. The ro
 
 ## Memory
 
-- Every turn is recorded as a session event in Iris Agent Memory. The service extracts long-term memories from sessions in the background, so new memories appear after its extraction window.
+- Answers from the FAQ, the cache and the LLM are recorded as session events in Iris Agent Memory, tagged with their route. Blocked messages are not recorded. The service extracts long-term memories from sessions in the background, so new memories appear after its extraction window.
 - Before answering, the app recalls the user's memories for the question and reads the session transcript.
 - User and session ids are limited to letters, digits and hyphens, so other characters become `-` (`demo_user` is stored as `demo-user`).
 - What is remembered, how long it is kept and what is excluded are service settings, configured in the Redis Cloud console.

@@ -47,6 +47,8 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 
 DEFAULT_USER = "demo_user"
 
+REJECT_MESSAGE = "This question violates the terms of our user agreement."
+
 LLM_PROMPT_PATH = Path(__file__).parent / os.getenv("LLM_PROMPT", "llm_prompt")
 SYSTEM_PROMPT = LLM_PROMPT_PATH.read_text(encoding="utf-8").strip()
 
@@ -86,13 +88,35 @@ class MemoryPromptAgent:
         except Exception:
             logger.debug("Agent Memory client was not open", exc_info=True)
 
-    async def _record_turn(self, session_id: str, user_id: str, role: str, content: str) -> None:
-        """Record one conversation turn as a session event."""
+    async def _record_turn(
+        self, session_id: str, user_id: str, role: str, content: str, source: str | None = None
+    ) -> None:
+        """Record one conversation turn as a session event.
+
+        `source` says which route produced the answer ("llm", "faq" or "cache"); it is
+        stored as event metadata, so it is visible in the transcript but never sent to the model.
+        """
         conversation = self._conversation(session_id, user_id)
+        metadata = {"source": source} if source else None
         if role == "user":
-            await conversation.auser(content)
+            await conversation.auser(content, metadata=metadata)
         else:
-            await conversation.aassistant(content)
+            await conversation.aassistant(content, metadata=metadata)
+
+    async def record_exchange(
+        self, session_id: str, user_id: str, user_input: str, response: str, source: str
+    ) -> None:
+        """Record a question and the reply of the FAQ or cache route in Agent Memory.
+
+        The LLM route records its own turns in process_user_input. Blocked ("reject") messages are
+        never recorded. A memory outage must not stop the reply the user is already owed, so
+        failures are logged and swallowed here.
+        """
+        try:
+            await self._record_turn(session_id, user_id, "user", user_input, source)
+            await self._record_turn(session_id, user_id, "assistant", response, source)
+        except Exception:
+            logger.exception("Could not record the %s exchange in Agent Memory", source)
 
     async def _get_memory_prompt(
         self,
@@ -249,7 +273,8 @@ class MemoryPromptAgent:
                 sugested_route = sw.get_route(user_input)
 
                 if sugested_route == "reject":
-                    print(f"[Semantic Router]: This question violates the terms of our user agreement.")
+                    # Blocked messages are deliberately not recorded in Agent Memory.
+                    print(f"[Semantic Router]: {REJECT_MESSAGE}")
                     print()
                     continue
 
@@ -260,6 +285,7 @@ class MemoryPromptAgent:
                         print(f"[FAQ Knowledge Base]:")
                         print(f"{faq_answer}")
                         print()
+                        await self.record_exchange(session_id, user_id, user_input, faq_answer, "faq")
                         continue
 
                 #CHECK SEMANTIC CACHE FOR SIMILAR QUESTIONS
@@ -268,7 +294,8 @@ class MemoryPromptAgent:
                     print(f"[Semantic Cache]:")
                     print(f"{cached_result}")
                     print()
-                    continue                  
+                    await self.record_exchange(session_id, user_id, user_input, cached_result, "cache")
+                    continue
 
                 # Process input and get response
                 print("🤔 Thinking...")
@@ -296,7 +323,7 @@ class MemoryPromptAgent:
         try:
             # Add user message to working memory first
             await self._record_turn(
-                session_id, user_id, "user", user_input
+                session_id, user_id, "user", user_input, "llm"
             )
 
             # Generate response using memory prompt (with memory visibility in demo mode)
@@ -306,7 +333,7 @@ class MemoryPromptAgent:
 
             # Add assistant response to working memory
             await self._record_turn(
-                session_id, user_id, "assistant", response
+                session_id, user_id, "assistant", response, "llm"
             )
 
             return response
