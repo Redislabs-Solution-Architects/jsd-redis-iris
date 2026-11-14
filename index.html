@@ -281,7 +281,7 @@
   <h1>IRIS Support Agent</h1>
   <div class="session-bar">
     <label>Session</label>
-    <input id="session-id" type="text" value="web_session" placeholder="session id" />
+    <input id="session-id" type="text" value="" placeholder="yyyyMMdd-HHmm" />
     <label>User</label>
     <input id="user-id" type="text" value="web_user" placeholder="user id" />
     <button id="ok-btn">OK</button>
@@ -313,8 +313,16 @@
   const inputArea    = document.getElementById('input-area');
   const sessionPrompt = document.getElementById('session-prompt');
 
+  // A new chat gets a session id from the current local date and time: yyyyMMdd-HHmm
+  function timestampSessionId(now = new Date()) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
+  }
+  sessionEl.value = timestampSessionId();
+
   let busy = false;
   let sessionConfirmed = false;
+  let awaitingUid = false;  // the welcome message asked for the UID and it has not been answered
 
   function confirmSession() {
     if (!sessionEl.value.trim() || !userEl.value.trim()) {
@@ -333,12 +341,28 @@
     inputArea.classList.remove('chat-disabled');
     okBtn.textContent  = 'Reset';
     inputEl.focus();
+    showWelcome();
+  }
+
+  // The welcome message is sent automatically when the chat starts.
+  async function showWelcome() {
+    try {
+      const res = await fetch('/welcome');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.message || !sessionConfirmed) return;
+      addBubble('assistant', data.message, 'welcome');
+      awaitingUid = data.awaiting_uid;
+    } catch (e) {
+      // no welcome message: the chat still works
+    }
   }
 
   function resetSession() {
     sessionEl.readOnly = false;
     userEl.readOnly    = false;
     sessionConfirmed   = false;
+    awaitingUid        = false;
 
     messagesEl.innerHTML        = '';
     messagesEl.style.display    = 'none';
@@ -364,7 +388,7 @@
     bubble.className = 'bubble';
 
     const BADGE_LABELS = { cache: 'Cached', faq: 'FAQ', rejected: 'Blocked' };
-    if (source && source !== 'llm') {
+    if (source && source !== 'llm' && source !== 'welcome') {
       const badge = document.createElement('div');
       badge.className = `badge ${source}`;
       badge.textContent = BADGE_LABELS[source] || source;
@@ -417,8 +441,10 @@
           message: text,
           session_id: sessionEl.value || 'web_session',
           user_id:    userEl.value    || 'web_user',
+          awaiting_uid: awaitingUid,
         }),
       });
+      awaitingUid = false;  // only the first message after the welcome can be the UID
 
       thinkingRow.remove();
 

@@ -1,0 +1,12 @@
+# Secrets / local config
+.env
+
+# Numbered prompt variants (llm_prompt1, llm_prompt2, ...)
+llm_prompt[0-9]*
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env.content
+.env.admin

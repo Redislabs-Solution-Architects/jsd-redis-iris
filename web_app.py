@@ -45,11 +45,18 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = "web_session"
     user_id: str = "web_user"
+    # True for the first message after the welcome message, which asked for the UID.
+    awaiting_uid: bool = False
 
 
 class ChatResponse(BaseModel):
     response: str
-    source: Literal["llm", "cache", "faq", "rejected"]
+    source: Literal["llm", "cache", "faq", "rejected", "welcome"]
+
+
+class WelcomeResponse(BaseModel):
+    message: str
+    awaiting_uid: bool
 
 
 @app.on_event("startup")
@@ -66,6 +73,13 @@ async def root():
     return FileResponse(html_path)
 
 
+@app.get("/welcome", response_model=WelcomeResponse)
+async def welcome():
+    """The message sent automatically when a chat starts (empty when the welcome flow is off)."""
+    greeting = get_agent().welcome.greeting
+    return WelcomeResponse(message=greeting, awaiting_uid=bool(greeting))
+
+
 async def reply(req: ChatRequest, response: str, source: str) -> ChatResponse:
     """Answer from the FAQ or the cache, recording the exchange in Agent Memory."""
     await get_agent().record_exchange(req.session_id, req.user_id, req.message, response, source)
@@ -76,6 +90,16 @@ async def reply(req: ChatRequest, response: str, source: str) -> ChatResponse:
 async def chat(req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # The reply to the welcome message: a message with an account number in it is answered from the
+    # memories held for the user name in the UI, without going through the router, the FAQ, the cache,
+    # the LLM or the context surface.
+    if req.awaiting_uid:
+        agent = get_agent()
+        account = agent.account_in(req.message)
+        if account:
+            who = await agent.identify(req.session_id, req.user_id, account, req.message)
+            return ChatResponse(response=who.response, source="welcome")
 
     if not utils.resolve_env("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
@@ -104,7 +128,7 @@ async def chat(req: ChatRequest):
     response = await agent.process_user_input(req.message, req.session_id, req.user_id)
 
     # Store in semantic cache on success
-    if "error processing your request" not in response:
+    if response.cacheable and "error processing your request" not in response:
         sw.set_cache(
             query=req.message,
             response=response,

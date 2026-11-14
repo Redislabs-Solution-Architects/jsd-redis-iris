@@ -1,14 +1,14 @@
 [
     {
         "name": "FAQ", 
-        "references": ["countries of operation","account recovery","veterans discount","hours of operation"]
+        "references": ["ETF Mutual Funds explanation concepts", "countries of operation","account settings","discount","hours of operation"]
     },
     {
         "name": "reject", 
-        "references": ["love","romance","sexual content","race", "violence", "crime","stereotype","serve alcohol", "food delivery" ]
+        "references": ["love","romance","marriage","sexual content","race", "general knowledge","violence", "crime","stereotype","serve alcohol", "food" ]
     },
     {
-        "name": "accept", 
-        "references": ["insurance","jewellery","health","policy","yes","no","hello","bye","thanks","proceed","KYC","personal details","preferences"]
+        "name": "LLM", 
+        "references": ["insurance","valuables","health","policy","claims","yes","no","hello","bye","thanks","proceed","KYC","personal details","preferences","finance","stocks","investments","recomend"]
     }
 ]

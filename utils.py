@@ -1,16 +1,22 @@
+import asyncio
 import logging
 import os
 import re
+import socket
+import sys
 import threading
+import time
 
+import httpx
 import redis
 import json
 
 from datetime import datetime
 from pathlib import Path
 
-from playbook_faq import sync_knowledge_base
+from playbook_faq import SUBJECT_ID_ATTRIBUTE, sync_knowledge_base
 from redis_iris import AgentPlaybooks
+from redis_iris.agent_playbooks import eq
 from redisvl.extensions.llmcache import SemanticCache
 from redisvl.extensions.router import  SemanticRouter
 from redisvl.query.filter import Tag
@@ -34,6 +40,144 @@ def resolve_env(var_name: str, default: str = "") -> str:
     if raw_value and raw_value in os.environ:
         return os.environ[raw_value]
     return raw_value
+
+
+# Delays between attempts when a connection cannot be opened. A DNS lookup that fails
+# ("getaddrinfo failed") on this network usually succeeds a moment later.
+CONNECT_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
+
+def is_connect_failure(exc: BaseException | None) -> bool:
+    """True when exc, anything it was raised from, or any member of an exception group is a
+    failure to open the connection (DNS lookup, refused, connect timeout). The request never
+    reached the server, so it is safe to repeat, even a write."""
+    seen: set[int] = set()
+    stack = [exc]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, socket.gaierror)):
+            return True
+        stack += [e.__cause__, e.__context__, *getattr(e, "exceptions", ())]
+    return False
+
+
+async def aretry(make_call, what: str, delays=CONNECT_RETRY_DELAYS):
+    """await make_call(), repeating it after a short wait when the connection cannot be opened.
+
+    make_call is a function that returns a fresh awaitable each time. Only connection failures
+    are retried (see is_connect_failure); every other error is raised at once. Each retry is one
+    warning line instead of a traceback. After the last attempt the original error is raised."""
+    for delay in (*delays, None):
+        try:
+            return await make_call()
+        except Exception as exc:
+            if delay is None or not is_connect_failure(exc):
+                raise
+            logger.warning("%s: could not connect (%s); retrying in %.1fs", what, _root_message(exc), delay)
+            await asyncio.sleep(delay)
+
+
+def retry(make_call, what: str, delays=(0.3, 0.6)):
+    """Blocking version of aretry for synchronous calls. The default waits are short because
+    the caller blocks while it waits."""
+    for delay in (*delays, None):
+        try:
+            return make_call()
+        except Exception as exc:
+            if delay is None or not is_connect_failure(exc):
+                raise
+            logger.warning("%s: could not connect (%s); retrying in %.1fs", what, _root_message(exc), delay)
+            time.sleep(delay)
+
+
+def _root_message(exc: BaseException) -> str:
+    while exc.__cause__ is not None:
+        exc = exc.__cause__
+    return str(exc)[:80]
+
+
+DEFAULT_LOG_LEVEL = "CRITICAL"  # the most severe level: with nothing set, the application logs next to nothing
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.CRITICAL,
+}
+
+
+def log_level() -> int:
+    """The level named by LOG_LEVEL (DEBUG, INFO, WARNING, ERROR or CRITICAL, any case), or
+    CRITICAL, the most severe, when it is unset, empty or not a level name."""
+    raw = os.getenv("LOG_LEVEL", "").strip().upper()
+    if raw and raw not in _LOG_LEVELS:
+        print(f"LOG_LEVEL={raw!r} is not a log level; using {DEFAULT_LOG_LEVEL}", file=sys.stderr)
+    return _LOG_LEVELS.get(raw, _LOG_LEVELS[DEFAULT_LOG_LEVEL])
+
+
+def configure_logging() -> int:
+    """Set the log level for the application from LOG_LEVEL and return it.
+
+    The HTTP and OpenAI client libraries log every request at INFO, which would bury the
+    application's own messages, so they are kept at WARNING or the chosen level, whichever is
+    more severe. The web server's loggers (uvicorn) are set to the same level."""
+    level = log_level()
+    logging.basicConfig(level=level)
+    logging.getLogger().setLevel(level)
+    for name in ("httpx", "httpcore", "openai"):
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))
+    # The web server's own lines (startup, and one access line per request) follow it too. uvicorn
+    # sets its loggers up before it imports the app, so setting their levels here takes effect.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).setLevel(level)
+    return level
+
+
+def env_flag(var_name: str, default: bool = True) -> bool:
+    """A true/false setting from the environment. false, 0, no and off (any case) mean False,
+    true, 1, yes and on mean True, and anything else, or an unset value, gives the default."""
+    value = resolve_env(var_name).strip().lower()
+    if value in ("false", "0", "no", "off"):
+        return False
+    if value in ("true", "1", "yes", "on"):
+        return True
+    return default
+
+
+_PROMPT_TAG = re.compile(r"<prompt>\s*(.*?)\s*</prompt>", re.DOTALL)
+_MAX_PROMPT_DEPTH = 5
+
+
+def load_prompt(path: str | Path, _chain: tuple[Path, ...] = ()) -> str:
+    """Read a prompt file, replacing every <prompt>file_name</prompt> with that file's content.
+
+    A file name is relative to the file that names it (or absolute). Included files may include
+    others, up to a depth of five. A missing file, a circular include or an empty result raises a
+    RuntimeError that names the file, so a bad prompt stops the app at startup instead of
+    silently dropping instructions."""
+    path = Path(path).resolve()
+    if path in _chain:
+        raise RuntimeError("Circular <prompt> include: " + " -> ".join(p.name for p in (*_chain, path)))
+    if len(_chain) >= _MAX_PROMPT_DEPTH:
+        raise RuntimeError(f"<prompt> includes are nested more than {_MAX_PROMPT_DEPTH} deep at {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        origin = f" (included from {_chain[-1]})" if _chain else ""
+        raise RuntimeError(f"Cannot read the prompt file {path}{origin}: {e}") from e
+
+    def include(match: re.Match[str]) -> str:
+        return load_prompt(path.parent / match.group(1), (*_chain, path)).strip()
+
+    text = _PROMPT_TAG.sub(include, text).strip()
+    if not text:
+        raise RuntimeError(f"The prompt file {path} is empty")
+    return text
 
 
 _INVALID_ID_CHARS = re.compile(r"[^a-zA-Z0-9-]")
@@ -113,7 +257,7 @@ class SemanticWrapper:
         llm_routes = load_dict_from_file(_APP_DIR / llm_router_file)
 
         #SEMANTIC ROUTER
-        print("Setting Up Semantic Router...")
+        logger.info("Setting Up Semantic Router...")
 
         # SemanticRouter's overwrite flag only recreates the index definition;
         # it does NOT drop existing route vectors (it calls index.create with
@@ -137,37 +281,50 @@ class SemanticWrapper:
 
     
 
-        #SEMANTIC CACHE
-        print("Setting Up Semantic Cache...")
+        #SEMANTIC CACHE (ENABLE_SEMANTIC_CACHE=false turns it off: no index is created, nothing is
+        #looked up or stored, and every question that reaches the LLM step is answered fresh)
+        self.cache_enabled = env_flag("ENABLE_SEMANTIC_CACHE", True)
+        self.semantic_cache = None
+        if self.cache_enabled:
+            logger.info("Setting Up Semantic Cache...")
 
-        # Entries are scoped per user and session via tag fields. An index
-        # created before these fields existed can't filter on them, so drop it
-        # (cache entries are short-lived anyway) and let it be recreated.
-        try:
-            existing_fields = [
-                attr[1] for attr in self.rds.ft("semantic:cache").info()["attributes"]
-            ]
-            if not {"user_id", "session_id"} <= set(existing_fields):
-                self.rds.ft("semantic:cache").dropindex(delete_documents=True)
-        except redis.exceptions.ResponseError:
-            pass  # index did not exist yet
+            # Entries are scoped per user and session via tag fields. An index
+            # created before these fields existed can't filter on them, so drop it
+            # (cache entries are short-lived anyway) and let it be recreated.
+            try:
+                existing_fields = [
+                    attr[1] for attr in self.rds.ft("semantic:cache").info()["attributes"]
+                ]
+                if not {"user_id", "session_id"} <= set(existing_fields):
+                    self.rds.ft("semantic:cache").dropindex(delete_documents=True)
+            except redis.exceptions.ResponseError:
+                pass  # index did not exist yet
 
-        self.semantic_cache = SemanticCache(
-            name="semantic:cache",
-            redis_client=self.rds,
-            ttl = 600,
-            distance_threshold=0.2,
-            filterable_fields=[
-                {"name": "user_id", "type": "tag"},
-                {"name": "session_id", "type": "tag"},
-            ],
-        )
+            self.semantic_cache = SemanticCache(
+                name="semantic:cache",
+                redis_client=self.rds,
+                ttl = 600,
+                distance_threshold=0.2,
+                filterable_fields=[
+                    {"name": "user_id", "type": "tag"},
+                    {"name": "session_id", "type": "tag"},
+                ],
+            )
+        else:
+            logger.info("Semantic Cache is disabled (ENABLE_SEMANTIC_CACHE=false)")
 
         #FAQ KNOWLEDGE BASE (Redis Iris Agent Playbooks)
-        print("Connecting to Agent Playbooks FAQ Knowledge Base...")
+        logger.info("Connecting to Agent Playbooks FAQ Knowledge Base...")
 
         playbook_environ = _playbook_environ()
         self.playbook = AgentPlaybooks.from_env(playbook_environ)
+
+        # SUBJECT_ID selects which subject's FAQs this application answers from. The knowledge base may
+        # hold entries for several subjects (each names its own attributes.subject_id) and all of them
+        # are loaded; only FAQs whose subject_id equals SUBJECT_ID are looked up. Empty means every
+        # FAQ in the Playbook is used.
+        self.subject_id = resolve_env("SUBJECT_ID").strip()
+        logger.info("FAQ subject: %s", self.subject_id or "(none: using every FAQ in the Playbook)")
 
         # knowledge-base.json is the source of truth: reconcile it with the Playbook on every
         # startup (unchanged entries are left alone). This runs in the background so the app
@@ -181,15 +338,16 @@ class SemanticWrapper:
                 _APP_DIR / os.getenv("KNOWLEDGE_BASE_FILE", "knowledge-base.json"),
                 playbook_environ,
                 resolve_env("PLAYBOOK_FAQ_PRUNE", "false").lower() == "true",
+                self.subject_id,
             ),
             name="faq-sync",
             daemon=True,
         )
         self._faq_sync_thread.start()
 
-    def _sync_faqs(self, knowledge_base_file, playbook_environ, prune):
+    def _sync_faqs(self, knowledge_base_file, playbook_environ, prune, subject_id=""):
         try:
-            sync_knowledge_base(knowledge_base_file, playbook_environ, prune=prune)
+            sync_knowledge_base(knowledge_base_file, playbook_environ, prune=prune, subject_id=subject_id)
         except Exception as exc:
             self.faq_sync_error = exc
             logger.error("FAQ knowledge base was not synced to Agent Playbooks: %s", exc)
@@ -205,7 +363,10 @@ class SemanticWrapper:
         if min_score is None:
             min_score = float(resolve_env("FAQ_SEMANTIC_THRESHOLD", "0.75"))
         try:
-            found = self.playbook.discover(user_query)
+            scope = eq(SUBJECT_ID_ATTRIBUTE, self.subject_id) if self.subject_id else None
+            found = retry(
+                lambda: self.playbook.discover(user_query, filter_=scope), "Agent Playbooks FAQ lookup"
+            )
         except Exception as exc:
             logger.warning("Agent Playbooks FAQ lookup failed: %s", exc)
             return "NONE"
@@ -220,6 +381,8 @@ class SemanticWrapper:
         return route_match.name
     
     def get_similar(self, user_query, user_id, session_id):
+        if not self.cache_enabled:
+            return "NONE"
         scope_filter = (Tag("user_id") == user_id) & (Tag("session_id") == session_id)
         cached_result_list = self.semantic_cache.check(
             prompt = user_query,
@@ -231,6 +394,8 @@ class SemanticWrapper:
         return "NONE"
 
     def set_cache(self, query, response, user_id, session_id):
+        if not self.cache_enabled:
+            return
         # filters are part of the entry key, so the same prompt from a
         # different user/session is stored separately, not overwritten.
         self.semantic_cache.store(
@@ -241,7 +406,8 @@ class SemanticWrapper:
 
     
     def clear_cache(self) :
-        self.semantic_cache.clear()
+        if self.cache_enabled:
+            self.semantic_cache.clear()
 
 
 
