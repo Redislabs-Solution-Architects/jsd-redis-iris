@@ -72,7 +72,7 @@ Set `CONTEXT_GATEWAY_URL` to the Gateway's MCP endpoint; the call is authenticat
 When a chat starts (after the Session and User ids are confirmed, or at the start of the terminal chat) the assistant sends a welcome message by itself. The message asks the user for their UID, which is their account number. The user's reply sets what happens next:
 
 1. If the reply contains an account number, alone or in a sentence such as "hi my account number is ACC000007", the app reads the long-term memories Agent Memory holds for the **user name entered in the UI** (the User field). The account number is not the lookup key, and nothing is read from the context surface, so the customer profile there is not consulted.
-2. If there are long-term memories of type `semantic` (the lasting facts and preferences, not the episodic "on that day, the user asked..." events), the model writes a sentence or two from them about what the assistant knows about the user, for example "I can see that you plan to retire in about 10 years and would like an investment strategy focused on regular income." It does not summarize the conversation or repeat what the assistant said. That sentence goes into the welcome-back message. `WELCOME_MEMORY_TYPE` changes the memory type, and an empty value uses every type. If the model cannot be reached, the memories are listed instead (up to 10), and if none of them is a lasting fact about the user, the "nothing on file" message is sent.
+2. If there are long-term memories left after the excluded types (`EXCLUDED_LTM_TYPES`, by default `semantic` and `episodic`, so custom types such as `preference` are what remain), the model writes a sentence or two from them about what the assistant knows about the user, for example "I can see that you prefer to be addressed as Mr. Dastur." It does not summarize the conversation or repeat what the assistant said. That sentence goes into the welcome-back message. If the model cannot be reached, the memories are listed instead (up to 10), and if none of them is a lasting fact about the user, the "nothing on file" message is sent.
 3. If there are none, it replies with the message that asks the user to share their preferences and anything else they want remembered.
 4. The exchange is recorded under the same user name. The account number is then part of the session, so later personal questions can be answered without asking for it again.
 
@@ -126,9 +126,9 @@ Copy `.env.example` to `.env` and fill it in. Never commit `.env`.
 | `SUBJECT_ID` | Which subject's FAQs this application answers from (see below). Empty uses every FAQ in the Playbook |
 | `FAQ_SEMANTIC_THRESHOLD` | Minimum Playbook score (0 to 1) for serving a FAQ directly. Default `0.75` |
 | `PLAYBOOK_FAQ_PRUNE` | `true` deletes Playbook FAQs that are no longer in the knowledge base file (only for the subjects named in it, when it has any). Irreversible. Default `false` |
-| `WELCOME_MESSAGE_FILE`, `WELCOME_BACK_MESSAGE_FILE`, `WELCOME_NEW_MESSAGE_FILE` | Files holding the welcome texts (see below). An empty `WELCOME_MESSAGE_FILE` turns the welcome flow off |
-| `WELCOME_BACK_PROMPT_FILE` | Instructions for the model that writes the welcome-back sentence |
-| `WELCOME_MEMORY_TYPE` | Memory type listed in the welcome-back message. Default `semantic`; empty lists every type |
+| `WELCOME_MESSAGE_FILE`, `EXTRACTED_MESSAGE_FILE`, `WELCOME_NEW_USER_MESSAGE_FILE` | Files holding the welcome texts (see below). An empty `WELCOME_MESSAGE_FILE` turns the welcome flow off |
+| `EXTRACTED_PROMPT_FILE` | Instructions for the model that writes the welcome-back sentence |
+| `EXCLUDED_LTM_TYPES` | Long-term memory types that are never passed on, neither in the welcome-back message nor to the LLM on each turn. Comma-separated, default `semantic,episodic` (so custom types such as `preference` are used). The first is sent to Agent Memory as a `memory_type` filter with the call and the rest are removed from the results. Empty excludes nothing |
 | `LLM_PROMPT`, `LLM_ROUTER_FILE` | System prompt file and router route definitions |
 | `LLM_TOOL_SELECTOR_PROMPT` | File with the tool selector's system prompt, the rules for choosing Gateway tools. Default `llm-prompt-tool-selector` |
 

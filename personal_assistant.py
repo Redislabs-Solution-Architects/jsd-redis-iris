@@ -31,6 +31,8 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from redis_iris import AgentMemory
+from redis_iris.agent_memory.values import Recall
+from redis_iris.agent_memory._wire import memory as _memory_from_wire
 
 import utils
 from context_retriever import DEFAULT_ACCOUNT_PATTERN, ContextRetriever
@@ -89,9 +91,9 @@ class WelcomeMessages:
 
         return cls(
             greeting=utils.load_prompt(Path(__file__).parent / greeting_file),
-            back=read("WELCOME_BACK_MESSAGE_FILE", "welcome-back-message"),
-            new=read("WELCOME_NEW_MESSAGE_FILE", "welcome-new-message"),
-            back_prompt=read("WELCOME_BACK_PROMPT_FILE", "welcome-back-prompt"),
+            back=read("EXTRACTED_MESSAGE_FILE", "welcome-back-message"),
+            new=read("WELCOME_NEW_USER_MESSAGE_FILE", "welcome-new-message"),
+            back_prompt=read("EXTRACTED_PROMPT_FILE", "welcome-back-prompt"),
         )
 
     @property
@@ -142,8 +144,15 @@ class MemoryPromptAgent:
         self.context = ContextRetriever.from_env()
         # Welcome flow: a greeting that asks for the UID, then a reply built from the user's memories.
         self.welcome = WelcomeMessages.from_env()
-        # Only memories of this type are listed in the welcome-back message (empty: every type).
-        self.welcome_memory_type = utils.resolve_env("WELCOME_MEMORY_TYPE", "semantic").strip().lower()
+        # Long-term memories of these types are never passed on, neither in the welcome-back message nor to the
+        # LLM on each turn (empty: nothing is excluded). The first type is sent to Agent Memory as a filter
+        # on memory_type with the call; the service accepts one "not equal" value per filter, so any further
+        # types are removed from what comes back.
+        self.excluded_memory_types = [
+            t.strip().lower()
+            for t in utils.resolve_env("EXCLUDED_LTM_TYPES", "semantic,episodic").split(",")
+            if t.strip()
+        ]
         self.account_re = re.compile(
             utils.resolve_env("CONTEXT_UID_PATTERN") or DEFAULT_ACCOUNT_PATTERN, re.IGNORECASE
         )
@@ -190,6 +199,49 @@ class MemoryPromptAgent:
         match = re.search(rf"(?<![A-Za-z0-9])(?:{self.account_re.pattern})(?![A-Za-z0-9])", message, re.IGNORECASE)
         return match.group(0).upper() if match else None
 
+    def _memory_filter(self, owner: str) -> dict[str, Any]:
+        """The filter sent with every long-term memory search: this owner's memories, and, when types
+        are excluded, {"memory_type": {"ne": <first excluded type>}}."""
+        filter_: dict[str, Any] = {"owner_id": {"eq": owner}}
+        if self.excluded_memory_types:
+            filter_["memory_type"] = {"ne": self.excluded_memory_types[0]}
+        return filter_
+
+    def _without_excluded(self, memories: list[Any]) -> list[Any]:
+        """Drop the memories of an excluded type (the service already removed the first one)."""
+        excluded = set(self.excluded_memory_types)
+        return [m for m in memories if (m.memory_type or "").lower() not in excluded]
+
+    async def _search_memories(self, request: dict[str, Any]) -> list[Any]:
+        """One search request, all its pages, as memory objects."""
+        found: list[Any] = []
+        cursor = None
+        while True:
+            page_request = {**request, **({"cursor": cursor} if cursor else {})}
+            page = await self.memory.client.search_long_term_memory_async(request=page_request)
+            found += [_memory_from_wire(item) for item in page.items]
+            cursor = page.next_cursor
+            if not cursor or "query" in request:  # a relevance search is one page: its top `limit`
+                return found
+
+    async def _list_memories(self, owner: str) -> list[Any]:
+        """Every long-term memory the owner holds, except the excluded types.
+
+        No query text is sent, so this is a listing, not a relevance search, read page by page (100
+        at a time). The SDK's own memories() cannot filter by type, so the search operation is
+        called directly, with the filter from _memory_filter."""
+        found = await self._search_memories({"filter_": self._memory_filter(owner), "limit": 100})
+        return self._without_excluded(found)
+
+    async def _recall_memories(self, query: str, owner: str, limit: int) -> Recall:
+        """The owner's memories most relevant to `query` (at most `limit`), except the excluded types.
+
+        The same relevance search as the SDK's recall(), with the memory_type filter added."""
+        found = await self._search_memories(
+            {"query": query, "filter_": self._memory_filter(owner), "limit": limit}
+        )
+        return Recall(tuple(self._without_excluded(found)))
+
     async def _describe_user(self, facts: list[str]) -> str | None:
         """A sentence or two on what is known about the user, written by the model from their
         memories (the welcome-back prompt sets the style), or None when none of the memories is a
@@ -218,8 +270,8 @@ class MemoryPromptAgent:
     ) -> Identification:
         """The user gave their UID (account number): greet them from what Agent Memory holds.
 
-        Only long-term memories of type WELCOME_MEMORY_TYPE (default "semantic") are used, and the
-        model turns them into a sentence about what is known about the user.
+        Long-term memories of the types in EXCLUDED_LTM_TYPES (default semantic and episodic) are left
+        out, and the model turns the rest into a sentence about what is known about the user.
         The memories are looked up under the user name entered in the UI (`user_id`), which is the
         owner every other turn is recorded and recalled under. The account number is not used as a
         lookup key, and nothing is read from the context surface, so the user's profile there is
@@ -231,17 +283,13 @@ class MemoryPromptAgent:
         found", so the user is never left without a reply."""
         owner = sanitize_id(user_id)
         try:
-            memories = await utils.aretry(lambda: self.memory.amemories(owner), "Agent Memory: list memories")
+            memories = await utils.aretry(lambda: self._list_memories(owner), "Agent Memory: list memories")
         except Exception:
             logger.exception("Could not read the memories of %s for the welcome message", owner)
             memories = []
 
         facts: list[str] = []
         for memory in memories:
-            # Long-term memories of the configured type only: semantic memories are lasting facts and
-            # preferences; episodic ones are events from past conversations ("On <date>, ...").
-            if self.welcome_memory_type and (memory.memory_type or "").lower() != self.welcome_memory_type:
-                continue
             text = " ".join(str(memory.text).split())
             if text and text not in facts:
                 facts.append(text)
@@ -281,7 +329,7 @@ class MemoryPromptAgent:
         """Build memory-enriched context: recalled long-term memories plus the session transcript."""
         # RECALL WHAT IS KNOWN ABOUT THE USER FOR THIS QUESTION
         known = await utils.aretry(
-            lambda: self.memory.arecall(user_input, owner=sanitize_id(user_id), limit=30),
+            lambda: self._recall_memories(user_input, sanitize_id(user_id), limit=30),
             "Agent Memory: recall",
         )
 
